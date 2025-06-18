@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "./";
+
+service Instruction {
+    rpc UploadFile (stream FileChunk) returns (Response);
+    rpc DownloadFile (Command) returns (stream FileChunk);
+    rpc HeartBeat (Command) returns (Response);
+    rpc Commandline (Command) returns (Response);
+    rpc StartStream () returns (Response);
+}
