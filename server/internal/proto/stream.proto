@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package stream;
+
+option go_package = "./";
+
+service Streamer {
+    rpc UploadFile (stream DataChunk) returns (Response);
+    rpc DownloadFile (Command) returns (stream DataChunk);
+    rpc OpenFile (Command) returns (Response);
+    rpc HeartBeat (Command) returns (Response);
+    rpc Commandline (Command) returns (Response);
+    rpc StreamFrames (Empty) returns (stream DataChunk);
+}
+
+message Empty {}
+
+message DataChunk {
+    bytes data = 1;
+}
+
+message Command {
+    string commandline = 1;
+}
+
+message Response {
+    int32 return_code = 1;
+    string message = 2;
+}
