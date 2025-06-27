@@ -24,7 +24,7 @@ func TestNewScreencapture(t *testing.T) {
 	func() {
 		var i int = 0
 		for frame := range sc.FrameChan() {
-			fmt.Fprintf(os.Stderr, "Saving frame %d to %s", len(frame), filepath.Join(".", fmt.Sprintf("test_frame_%v.jpg", i)))
+			fmt.Fprintf(os.Stderr, "Saving frame %d to %s", len(frame), filepath.Join("/home/shhong/Desktop/source/boxer-rpc-client/server/internal/screencapture", fmt.Sprintf("test_frame_%v.jpg", i)))
 			if len(frame) == 0 {
 				t.Fatalf("Received empty frame from screencapture")
 				return
