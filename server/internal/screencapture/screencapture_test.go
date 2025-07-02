@@ -2,6 +2,7 @@ package screencapture_test
 
 import (
 	"fmt"
+	"image/png"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +12,7 @@ import (
 )
 
 func TestNewScreencapture(t *testing.T) {
-	sc, err := screencapture.NewScreencapture()
+	sc, err := screencapture.NewScreencapture(3)
 	if err != nil {
 		t.Fatalf("Failed to create new screencapture: %v", err)
 		return
@@ -21,38 +22,52 @@ func TestNewScreencapture(t *testing.T) {
 		t.Fatalf("Failed to start screencapture: %v", err)
 		return
 	}
-	func() {
+
+	go func() {
 		var i int = 0
 		for frame := range sc.FrameChan() {
-			fmt.Fprintf(os.Stderr, "Saving frame %d to %s", len(frame), filepath.Join("/home/shhong/Desktop/source/boxer-rpc-client/server/internal/screencapture", fmt.Sprintf("test_frame_%v.jpg", i)))
-			if len(frame) == 0 {
-				t.Fatalf("Received empty frame from screencapture")
-				return
+			if len(frame.Pix) == 0 {
+				t.Logf("Received empty frame from screencapture")
+				continue
 			}
 			// save frame to jpeg file for testing
-			filename := filepath.Join(".", fmt.Sprintf("test_frame_%v.jpg", i))
+			filename := filepath.Join(".", fmt.Sprintf("test_frame_%v.png", i))
 			i++
-			err := os.WriteFile(filename, frame, 0644)
+			// encode to PNG format
+			t.Logf("Saving frame to file %s", filename)
+			file, err := os.Create(filename)
 			if err != nil {
-				t.Fatalf("Failed to write frame to file %s: %v", filename, err)
+				t.Fatalf("Failed to create file %s: %v", filename, err)
 				return
 			}
+			err = png.Encode(file, frame)
+			if err != nil {
+				t.Fatalf("Failed to encode frame to PNG: %v", err)
+				file.Close()
+				return
+			}
+			file.Close()
 		}
 	}()
 
-	func() {
+	go func() {
 		// timer thread to stop screencapture after 5 seconds
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
+		t.Logf("Screencapture stopped after 2 second")
 		err = sc.Stop()
+		t.Logf("Screencapture stopped: %v", err)
 		if err != nil {
 			t.Fatalf("Failed to stop screencapture: %v", err)
 			return
 		}
 	}()
 
-	_, err = sc.Wait()
+	// wait for screencapture to finish
+	t.Logf("Waiting for screencapture to finish...")
+	err = sc.Wait()
 	if err != nil {
 		t.Fatalf("Failed to wait for screencapture: %v", err)
 		return
 	}
+	t.Logf("Screencapture finished successfully")
 }

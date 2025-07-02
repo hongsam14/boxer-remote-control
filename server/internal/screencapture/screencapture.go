@@ -1,247 +1,220 @@
 package screencapture
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"io"
 	"os"
-	"runtime"
-	"strings"
+	"time"
 
 	berror "github.com/hongsam14/boxer-remote-control/error"
-	"github.com/hongsam14/boxer-remote-control/server/internal/exec"
-)
-
-const (
-	_FFMPEG_BIN = "ffmpeg"
-	_LINUX      = "-f x11grab -video_size 1280x720 -i :0.0 -f mjpeg pipe:1 -q:v 5"
-	_WINDOWS    = "-f gdigrab -framerate 15 -i desktop -f mjpeg pipe:1 -q:v 5"
-	_DARWIN     = "-f avfoundation -framerate 15 -i 1 -f mjpeg pipe:1 -q:v 5"
+	"github.com/kbinani/screenshot"
+	"golang.org/x/sync/errgroup"
 )
 
 type Screencapture interface {
 	Start() error
-	Wait() (int, error)
+	Wait() error
 	Stop() error
-	FrameChan() <-chan []byte
+	FrameChan() <-chan *image.RGBA
 }
 
 type screencapture struct {
 	ctx    context.Context
 	cancel context.CancelFunc
-	// promise to run the screencapture command
-	promise exec.Promise
-	// frame reader
-	reader *bufio.Reader
+	// scanner context cancel
+	scannerCtx    context.Context
+	scannerCancel context.CancelFunc
+	// errgroup
+	captureGrp *errgroup.Group
+	// screen infos
+	numActivateScreens int
+	bounds             image.Rectangle
+	// config
+	frameRate uint
 	// pipe
-	framePipe *bytes.Buffer
+	frameReader *io.PipeReader
+	frameWriter *io.PipeWriter
 	// output channel for frames
-	frameChan chan []byte
+	frameChan chan *image.RGBA
 }
 
-func (sc *screencapture) FrameChan() <-chan []byte {
+func (sc *screencapture) FrameChan() <-chan *image.RGBA {
 	return sc.frameChan
 }
 
-func NewScreencapture() (Screencapture, error) {
-	var err error
-
+func NewScreencapture(frameRate uint) (Screencapture, error) {
 	newSC := new(screencapture)
 
 	// create a context for the screencapture
 	newSC.ctx, newSC.cancel = context.WithCancel(context.Background())
+	// create a context for the scanner
+	newSC.scannerCtx, newSC.scannerCancel = context.WithCancel(context.Background())
 
 	// create a channel to send frames
-	newSC.frameChan = make(chan []byte, 10) // buffer size of 10 frames
+	newSC.frameChan = make(chan *image.RGBA, 10) // buffer size of 10 frames
 
-	// create a pipe to get output from ffmpeg
-	// input buffer 1280 * 720 * 3 + 2 bytes (RGB)
-	newSC.framePipe = bytes.NewBuffer(make([]byte, 0, 1280*720*3+2))
-	if err != nil {
+	// get screen information
+	newSC.numActivateScreens = screenshot.NumActiveDisplays()
+	if newSC.numActivateScreens <= 0 {
 		return nil, berror.BoxerError{
-			Code:   berror.SystemError,
+			Code:   berror.InvalidState,
 			Msg:    "error while NewScreencapture",
-			Origin: err,
+			Origin: fmt.Errorf("no active screens found"),
 		}
 	}
-	// create a reader for the frame output
-	newSC.reader = bufio.NewReader(newSC.framePipe)
+	newSC.bounds = screenshot.GetDisplayBounds(0)
+	if newSC.bounds.Empty() {
+		return nil, berror.BoxerError{
+			Code:   berror.InvalidState,
+			Msg:    "error while NewScreencapture",
+			Origin: fmt.Errorf("failed to get display bounds for screen 0"),
+		}
+	}
 
-	newSC.promise = nil
+	fmt.Fprintf(os.Stderr, "Screencapture: %d active screens found, bounds: %v\n", newSC.numActivateScreens, newSC.bounds)
 
+	// create a pipe to get output from ffmpeg
+	newSC.frameReader, newSC.frameWriter = io.Pipe()
+	// config
+	newSC.frameRate = frameRate
+	// create errgroup for captureThread
+	newSC.captureGrp, _ = errgroup.WithContext(newSC.ctx)
 	return newSC, nil
 }
 
 func (sc *screencapture) Start() error {
-	var (
-		err error
-	)
-
-	// create cmdline for ffmpeg
-	switch runtime.GOOS {
-	case "linux":
-		sc.promise, err = exec.Run(
-			os.Stdin,
-			sc.framePipe,
-			_FFMPEG_BIN,
-			strings.Split(_LINUX, " ")...)
-	case "darwin":
-		sc.promise, err = exec.Run(
-			os.Stdin,
-			sc.framePipe,
-			_FFMPEG_BIN,
-			strings.Split(_DARWIN, " ")...)
-	case "windows":
-		sc.promise, err = exec.Run(
-			os.Stdin,
-			sc.framePipe,
-			_FFMPEG_BIN,
-			strings.Split(_WINDOWS, " ")...)
-	default:
-		return berror.BoxerError{
-			Code:   berror.InternalError,
-			Msg:    "error in start function",
-			Origin: fmt.Errorf("unsupported OS: %s", runtime.GOOS),
-		}
-	}
-	if err != nil {
-		return berror.BoxerError{
-			Code:   berror.SystemError,
-			Msg:    "error while starting screencapture",
-			Origin: err,
-		}
-	}
+	// start capture thread
+	sc.captureGrp.Go(sc.captureThread)
 	// start the scanner thread to read frames
-	go sc.scannerThread()
+	sc.captureGrp.Go(sc.scannerThread)
 	return nil
 }
 
-func (sc *screencapture) Wait() (int, error) {
-	if sc.promise == nil {
-		return 0, berror.BoxerError{
-			Code:   berror.InvalidState,
-			Msg:    "error while Wait() function",
-			Origin: fmt.Errorf("screencapture promise is not initialized"),
-		}
-	}
-
-	exitCode, err := sc.promise.Wait()
+func (sc *screencapture) Wait() error {
+	err := sc.captureGrp.Wait()
 	if err != nil {
-		return exitCode, berror.BoxerError{
+		return berror.BoxerError{
 			Code:   berror.SystemError,
 			Msg:    "error while Wait() function",
 			Origin: err,
 		}
 	}
-	return exitCode, nil
+	// close the frame channel
+	close(sc.frameChan)
+	return nil
 }
 
 func (sc *screencapture) Stop() error {
-	if sc.promise == nil {
-		return berror.BoxerError{
-			Code:   berror.InvalidState,
-			Msg:    "error while Stop() function",
-			Origin: fmt.Errorf("screencapture promise is not initialized"),
-		}
-	}
-
-	// cancel the promise
-	if err := sc.promise.Cancel(); err != nil {
-		return berror.BoxerError{
-			Code:   berror.SystemError,
-			Msg:    "error while Stop() function",
-			Origin: err,
-		}
-	}
-
-	// close the pipes
-	close(sc.frameChan)
-
 	// cancel the context
 	sc.cancel()
-
+	fmt.Fprintf(os.Stderr, "Screencapture: capture thread called\n")
+	// sc.scannerCancel()
+	// fmt.Fprintf(os.Stderr, "Screencapture: scanner thread stopped\n")
 	return nil
 }
 
-func (sc *screencapture) scannerThread() {
-
+func (sc *screencapture) captureThread() error {
 	var (
-		buf       bytes.Buffer
-		b, b1, b2 byte
-		frame     []byte
-		err       error
+		err error
+		img *image.RGBA
 	)
+
+	// calculate the frame rate in miliseconds
+	frameRateMs := 1000 / int(sc.frameRate)
+
+	// create a ticker to capture frames at the specified frame rate
+	ticker := time.NewTicker(time.Duration(frameRateMs) * time.Millisecond)
+	defer ticker.Stop()
+	defer sc.frameWriter.Close()
 
 	for {
 		select {
 		case <-sc.ctx.Done():
+			// if the context is done, we stop the capture thread.
+			// this is to ensure that we don't leak goroutines
+			// close the pipes
+			fmt.Fprintf(os.Stderr, "Screencapture: capture thread stopped\n")
+			return nil
+		case <-ticker.C:
+			// capture the screen
+			img, err = screenshot.CaptureRect(sc.bounds)
+			if err != nil {
+				// create a channel to send framesp()
+				return berror.BoxerError{
+					Code:   berror.InternalError,
+					Origin: err,
+					Msg:    "error in captureThread function",
+				}
+			}
+			if len(img.Pix) <= 0 {
+				// if the captured image is empty, we skip this frame
+				return berror.BoxerError{
+					Code:   berror.InternalError,
+					Origin: fmt.Errorf("captured image is empty"),
+					Msg:    "error in captureThread function",
+				}
+			}
+			// write the captured image to the pipe
+			_, err = sc.frameWriter.Write(img.Pix)
+			if err != nil {
+				return berror.BoxerError{
+					Code:   berror.InternalError,
+					Origin: err,
+					Msg:    "error in captureThread function",
+				}
+			}
+			fmt.Fprintf(os.Stderr, "Screencapture: captured frame at %v\n", time.Now())
+		}
+	}
+}
+
+func (sc *screencapture) scannerThread() error {
+
+	var (
+		l     int
+		frame []byte
+		img   *image.RGBA
+		err   error
+	)
+
+	frame = make([]byte, sc.bounds.Dx()*sc.bounds.Dy()*4)
+	defer sc.frameReader.Close()
+	for {
+		select {
+		case <-sc.scannerCtx.Done():
 			// if the context is done, we stop the scanner thread.
 			// this is to ensure that we don't leak goroutines
-			return
+			fmt.Fprintf(os.Stderr, "Screencapture: scanner thread stopped\n")
+			return nil
 		default:
 			// read frame from the frame pipe buffer
-			// find jpeg frame starting with 0xFFD8
-			b1, err = sc.reader.ReadByte()
-			// check if we can read the next byte
-			// if not, we will break the loop
+			l, err = io.ReadFull(sc.frameReader, frame)
 			if err != nil {
-				// if we reach the end of the stream, break
-				if err.Error() == "EOF" {
-					return
+				if err == io.EOF {
+					// if we reach EOF, we stop the scanner thread
+					fmt.Fprintf(os.Stderr, "Screencapture: scanner thread reached EOF %v\n", l)
+					return nil
 				}
-				return
+				return berror.BoxerError{
+					Code:   berror.InternalError,
+					Origin: err,
+					Msg:    "error in scannerThread",
+				}
 			}
-			if b1 != 0xFF {
+			if l < 0 {
+				// if we read 0 bytes, we continue to the next iteration
+				fmt.Fprintf(os.Stderr, "Screencapture: scanner thread read 0 bytes\n")
 				continue
 			}
-			b2, err = sc.reader.ReadByte()
-			// check if we can read the next byte
-			// if not, we will break the loop
-			if err != nil {
-				// if we reach the end of the stream, break
-				if err.Error() == "EOF" {
-					return
-				}
-				return
-			}
-			if b2 != 0xD8 {
-				continue
-			}
-			// reset the buffer before writing the frame
-			buf.Reset()
-
-			// write the first two bytes to the buffer
-			// which are the start of the JPEG frame
-			// 0xFFD8 is the JPEG SOI (Start of Image) marker
-			// and we need to include it in the frame
-			buf.Write([]byte{b1, b2})
-
-			for {
-				b, err = sc.reader.ReadByte()
-				if err != nil {
-					// if we reach the end of the stream, break
-					if err.Error() == "EOF" {
-						if buf.Len() > 0 {
-							// send the last frame if it is not empty
-							sc.frameChan <- buf.Bytes()
-						}
-						return
-					}
-					return
-				}
-				buf.WriteByte(b)
-
-				if buf.Len() > 2 &&
-					buf.Bytes()[buf.Len()-2] == 0xFF &&
-					buf.Bytes()[buf.Len()-1] == 0xD9 {
-					break
-				}
-			}
-			// create a frame from the buffer
-			frame = buf.Bytes()
 			// send the frame to the channel
-			sc.frameChan <- frame
+			img = &image.RGBA{
+				Pix:    frame,
+				Stride: sc.bounds.Dx() * 4,
+				Rect:   sc.bounds,
+			}
+			sc.frameChan <- img
 		}
 	}
 }
